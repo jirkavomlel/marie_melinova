@@ -1,0 +1,249 @@
+---
+title: "BN combined with PCA"
+author: "Jirka Vomlel"
+date: "2026-03-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+## 
+
+Gaussian BN learning on PCA-transformed variable groups
+with combined BIC (BN BIC + PPCA log-likelihood penalty)
+
+Reference: Tipping M.E. & Bishop C.M. (1999). Probabilistic Principal Component Analysis. JRSS-B, 61: 611-622. https://doi.org/10.1111/1467-9868.00196
+Required package: bnlearn. Install with: install.packages("bnlearn")
+
+```{r}
+library(bnlearn)
+```
+
+1. PPCA log-likelihood at ML estimates for a single group Model: 
+x = W z + mu + eps,  z ~ N(0, I_k),  eps ~ N(0, sigma^2 I_p) => x ~ N(mu, W W^T + sigma^2 I_p)
+  
+ML estimates (Tipping & Bishop 1999):
+    sigma^2_hat = mean of discarded eigenvalues of the ML covariance
+    W_ML        = U_k (Lambda_k - sigma^2 I)^{1/2} R  (R arbitrary rotation)
+
+Log-likelihood at ML estimates:
+    L = -(n/2) [ p log(2 pi) + sum_{j=1}^k log(lambda_j) + (p-k) log(sigma^2_hat) + p ]
+
+Arguments:
+  X_group : n x p_j matrix for this group (raw, un-centered is fine)
+  k       : number of retained PCs (must satisfy 1 <= k < p_j)
+
+Returns: scalar log-likelihood value
+
+```{r}
+# Replaces ppca_loglik
+ppca_conditional_loglik <- function(X_group, k) {
+  n <- nrow(X_group)
+  p <- ncol(X_group)
+
+  if (k < 1 || k >= p)
+    stop(sprintf("k must satisfy 1 <= k < p. Got k=%d, p=%d.", k, p))
+
+  pca_res     <- prcomp(X_group, center = TRUE, scale. = FALSE)
+  eigenvalues <- (pca_res$sdev^2) * (n - 1) / n
+
+  # sigma^2 averaged over ALL p dimensions (fitted residual is 0 in first k dims)
+  sigma2_hat  <- sum(eigenvalues[(k + 1):p]) / p
+
+  if (sigma2_hat <= .Machine$double.eps) {
+    warning(sprintf("Group p=%d, k=%d: sigma2 near zero.", p, k))
+    return(NA_real_)
+  }
+
+  -(n * p / 2) * (log(2 * pi) + log(sigma2_hat) + 1)
+}
+```
+
+2. Number of free parameters in PPCA for a single group
+  - Loading matrix W: k*p entries, minus k*(k-1)/2 for rotational
+    indeterminacy (the non-identifiability of W up to orthogonal rotation)
+  - Noise variance sigma^2: 1 parameter
+  - Group means mu: p parameters
+
+Arguments:
+  p : number of variables in the group
+  k : number of retained PCs
+
+Returns: integer parameter count
+
+```{r}
+ppca_nparams <- function(p, k) {
+  k * p - k * (k - 1) / 2 + 1 + p
+}
+```
+
+3. Main function: learn BN on PC scores, compute combined BIC
+
+Arguments:
+  data   : n x P data frame or matrix (all observed variables)
+  groups : list of length g, each element is an integer vector of column
+           indices belonging to that group; groups must be disjoint
+  n_pcs  : integer vector of length g; n_pcs[j] = number of PCs for group j
+           must satisfy 1 <= n_pcs[j] < length(groups[[j]])
+
+Returns: named list with
+  $bn_structure   bnlearn bn object (learned DAG)
+  $bn_fit         bnlearn bn.fit object (fitted Gaussian BN)
+  $pc_data        data frame of all PC scores used as BN variables
+  $bn_loglik      log-likelihood of the BN on pc_data
+  $bn_bic_score   BIC score of BN from bnlearn (= loglik - log(n)/2 * d_BN)
+  $bn_nparams     number of free parameters in the BN
+  $ppca_logliks   vector of PPCA log-likelihoods per group
+  $ppca_nparams   vector of PPCA parameter counts per group
+  $total_loglik   bn_loglik + sum(ppca_logliks)
+  $total_nparams  bn_nparams + sum(ppca_nparams)
+  $bic_combined   the combined BIC criterion (higher = better)
+
+```{r}
+learn_bn_pca_bic <- function(data, groups, n_pcs) {
+
+  data <- as.matrix(data)
+  n    <- nrow(data)
+  g    <- length(groups)
+
+  if (length(n_pcs) != g)
+    stop("Length of n_pcs must equal number of groups.")
+  for (j in seq_len(g)) {
+    p_j <- length(groups[[j]])
+    if (n_pcs[j] < 1 || n_pcs[j] >= p_j)
+      stop(sprintf("Group %d: n_pcs=%d must satisfy 1 <= n_pcs < %d.", j, n_pcs[j], p_j))
+  }
+
+  pc_list          <- vector("list", g)
+  ppca_ll_vals     <- numeric(g)
+  ppca_nparam_vals <- integer(g)
+
+  for (j in seq_len(g)) {
+    X_j <- data[, groups[[j]], drop = FALSE]
+    k_j <- n_pcs[j]
+    p_j <- ncol(X_j)
+
+    pca_j    <- prcomp(X_j, center = TRUE, scale. = FALSE)
+    scores_j <- pca_j$x[, 1:k_j, drop = FALSE]
+    colnames(scores_j) <- paste0("G", j, "_PC", seq_len(k_j))
+
+    pc_list[[j]]        <- scores_j
+    ppca_ll_vals[j]     <- ppca_conditional_loglik(X_j, k_j)  
+    ppca_nparam_vals[j] <- ppca_nparams(p_j, k_j)             
+  }
+
+  pc_data <- as.data.frame(do.call(cbind, pc_list))
+  bn_dag  <- hc(pc_data, score = "bic-g")
+  bn_fit  <- bn.fit(bn_dag, pc_data)
+
+  bn_ll      <- as.numeric(logLik(bn_fit, data = pc_data))
+  bn_bic_val <- score(bn_dag, data = pc_data, type = "bic-g")
+  bn_nparams <- round(2 * (bn_ll - bn_bic_val) / log(n))
+
+  total_ll      <- bn_ll + sum(ppca_ll_vals)
+  total_nparams <- bn_nparams + sum(ppca_nparam_vals)
+  bic_combined  <- total_ll - (log(n) / 2) * total_nparams
+
+  list(
+    bn_structure  = bn_dag,
+    bn_fit        = bn_fit,
+    pc_data       = pc_data,
+    bn_loglik     = bn_ll,
+    bn_bic_score  = bn_bic_val,
+    bn_nparams    = bn_nparams,
+    ppca_logliks  = ppca_ll_vals,
+    ppca_nparams  = ppca_nparam_vals,
+    total_loglik  = total_ll,
+    total_nparams = total_nparams,
+    bic_combined  = bic_combined
+  )
+}
+```
+
+ 4. Example usage
+
+```{r}
+set.seed(42)
+n <- 200
+
+# Simulate 10 variables with some correlation structure
+Sigma <- matrix(0.4, nrow = 10, ncol = 10)
+diag(Sigma) <- 1
+L     <- chol(Sigma)
+X_sim <- matrix(rnorm(n * 10), nrow = n) %*% L
+colnames(X_sim) <- paste0("V", 1:10)
+
+# Define 3 groups: {V1..V4}, {V5..V7}, {V8..V10}
+groups <- list(1:4, 5:7, 8:10)
+n_pcs  <- c(2, 2, 2)   # retain 2 PCs per group
+
+result <- learn_bn_pca_bic(X_sim, groups, n_pcs)
+
+cat("=== Learned BN structure ===\n")
+print(result$bn_structure)
+
+cat("\n=== PPCA log-likelihoods per group ===\n")
+for (j in seq_along(groups)) {
+  cat(sprintf("  Group %d: loglik = %.3f,  nparams = %d\n",
+              j, result$ppca_logliks[j], result$ppca_nparams[j]))
+}
+
+cat("\n=== BN component ===\n")
+cat(sprintf("  BN log-likelihood : %.3f\n", result$bn_loglik))
+cat(sprintf("  BN BIC score      : %.3f\n", result$bn_bic_score))
+cat(sprintf("  BN nparams        : %d\n",   result$bn_nparams))
+
+cat("\n=== Combined BIC ===\n")
+cat(sprintf("  Total log-likelihood : %.3f\n", result$total_loglik))
+cat(sprintf("  Total nparams        : %d\n",   result$total_nparams))
+cat(sprintf("  Combined BIC         : %.3f\n", result$bic_combined))
+```
+
+5. Granularity search: compare combined BIC across different n_pcs choices
+
+```{r}
+
+cat("\n=== Granularity search over number of PCs per group ===\n")
+
+# Define candidate PC counts per group (must be < group size)
+candidates <- list(
+  G1 = 1:3,   # group 1 has 4 variables -> k in {1,2,3}
+  G2 = 1:2,   # group 2 has 3 variables -> k in {1,2}
+  G3 = 1:2    # group 3 has 3 variables -> k in {1,2}
+)
+
+grid <- expand.grid(candidates)
+results_grid <- vector("list", nrow(grid))
+
+for (i in seq_len(nrow(grid))) {
+  k_vec <- as.integer(grid[i, ])
+  res_i <- learn_bn_pca_bic(X_sim, groups, k_vec)
+  results_grid[[i]] <- data.frame(
+    G1_npc       = k_vec[1],
+    G2_npc       = k_vec[2],
+    G3_npc       = k_vec[3],
+    bic_combined = res_i$bic_combined
+  )
+}
+
+grid_df <- do.call(rbind, results_grid)
+grid_df <- grid_df[order(-grid_df$bic_combined), ]
+cat("\nTop 5 granularity configurations (higher BIC_combined = better):\n")
+print(head(grid_df, 5), row.names = FALSE)
+
+best_idx <- which.max(grid_df$bic_combined)
+cat(sprintf("\nBest configuration: G1=%d PC, G2=%d PC, G3=%d PC  (BIC_combined=%.3f)\n",
+            grid_df$G1_npc[best_idx],
+            grid_df$G2_npc[best_idx],
+            grid_df$G3_npc[best_idx],
+            grid_df$bic_combined[best_idx]))
+```
+

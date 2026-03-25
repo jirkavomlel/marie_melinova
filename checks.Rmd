@@ -1,0 +1,215 @@
+---
+title: "Sanity checks"
+author: "Jirka Vomlel"
+date: "2026-03-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(mvtnorm)
+
+# --- Define a known PPCA model ---
+set.seed(123)
+n     <- 1000   # large n so ML estimates are close to truth
+p     <- 6
+k     <- 2
+
+mu     <- rnorm(p)
+sigma2 <- 0.5
+
+# Random loading matrix W (p x k)
+W <- matrix(rnorm(p * k), nrow = p, ncol = k)
+
+# --- Generate data from the true model ---
+Z <- matrix(rnorm(n * k), nrow = n)          # latent scores ~ N(0, I_k)
+E <- matrix(rnorm(n * p, sd = sqrt(sigma2)), nrow = n)  # noise
+X_group <- sweep(Z %*% t(W) + E, 2, mu, "+") # n x p data matrix
+
+# --- Ground truth log-likelihood via implied multivariate normal ---
+C        <- W %*% t(W) + sigma2 * diag(p)
+ll_exact <- sum(dmvnorm(X_group, mean = mu, sigma = C, log = TRUE))
+
+# --- PPCA log-likelihood at ML estimates ---
+ll_ppca <- ppca_loglik(X_group, k)
+
+cat(sprintf("True model log-likelihood : %.3f\n", ll_exact))
+cat(sprintf("PPCA ML log-likelihood    : %.3f\n", ll_ppca))
+cat(sprintf("Difference (should be small for large n): %.3f\n", ll_ppca - ll_exact))
+stopifnot(ll_ppca >= ll_exact)  # ML estimates cannot do worse than true params
+```
+
+```{r}
+X_test <- matrix(rnorm(300 * 8), nrow = 300)
+lls <- sapply(1:7, function(k) ppca_loglik(X_test, k))
+stopifnot(all(diff(lls) > 0))
+```
+
+```{r}
+# Assumes W, sigma2, mu, p, k (=2), X_group are still in the workspace from check 1
+
+# Compute PPCA log-likelihood for all candidate k values
+lls_structured <- sapply(1:(p - 1), function(k_try) ppca_loglik(X_group, k_try))
+diffs          <- diff(lls_structured)
+
+cat("Log-likelihoods by k:\n")
+for (k_try in 1:(p - 1)) {
+  cat(sprintf("  k = %d:  loglik = %10.3f  gain over k-1 = %s\n",
+              k_try,
+              lls_structured[k_try],
+              if (k_try == 1) "       -" else sprintf("%8.3f", diffs[k_try - 1])))
+}
+
+cat(sprintf("\nTrue k* = %d\n", k))
+cat("Gains should be large for k <= k* and drop sharply afterwards.\n")
+```
+```{r}
+plot(1:(p-1), lls_structured, type = "b", pch = 19,
+     xlab = "k (number of retained PCs)",
+     ylab = "PPCA log-likelihood",
+     main = sprintf("PPCA log-likelihood vs k  (true k* = %d)", k))
+abline(v = k, lty = 2, col = "red")
+legend("bottomright", legend = "true k*", lty = 2, col = "red")
+```
+
+=============================================================================
+Check 5: BN parameter count recovery
+=============================================================================
+ A Gaussian BN with structure [A][B|A] has exactly 5 free parameters:
+  Node A ~ N(mu_A, sigma2_A)          -> 2 params: mu_A, sigma2_A
+  Node B|A ~ N(a + b*A, sigma2_B)     -> 3 params: a, b, sigma2_B
+  Total = 5
+
+
+```{r}
+set.seed(42)
+n_check5 <- 500
+A  <- rnorm(n_check5)
+B  <- 1.5 + 0.8 * A + rnorm(n_check5, sd = 0.5)
+df_check5 <- data.frame(A = A, B = B)
+
+dag_check5 <- model2network("[A][B|A]")
+fit_check5 <- bn.fit(dag_check5, df_check5)
+
+ll_check5  <- as.numeric(logLik(fit_check5, data = df_check5))
+bic_check5 <- score(dag_check5, data = df_check5, type = "bic-g")
+
+bn_nparams_check5 <- round(2 * (ll_check5 - bic_check5) / log(n_check5))
+
+cat(sprintf("Recovered BN nparams : %d  (expected: 5)\n", bn_nparams_check5))
+stopifnot(bn_nparams_check5 == 5)
+cat("Check 5 passed.\n")
+```
+=============================================================================
+Check 6: combined BIC recovers the correct granularity on synthetic data
+=============================================================================
+We generate data from a known PPCA + BN model with:
+  Group 1: p=5 variables, true k*=2
+  Group 2: p=4 variables, true k*=1
+  Group 3: p=4 variables, true k*=2
+with a simple BN structure G1_PC1 -> G2_PC1 -> G3_PC1 on the latent scores
+
+```{r}
+set.seed(99)
+n6  <- 500
+k_true <- c(2, 1, 2)   # true granularity we want to recover
+p_grps <- c(5, 4, 4)   # group sizes
+
+sigma2_grps <- c(0.3, 0.4, 0.3)   # PPCA noise per group
+
+# --- Simulate latent BN scores ---
+# Simple chain: Z1_1 -> Z2_1 -> Z3_1, others independent
+Z1 <- cbind(rnorm(n6), rnorm(n6))                          # G1: 2 latent dims
+Z2 <- cbind(0.7 * Z1[,1] + rnorm(n6, sd=0.5))             # G2: 1 latent dim
+Z3 <- cbind(0.6 * Z2[,1] + rnorm(n6, sd=0.5), rnorm(n6)) # G3: 2 latent dims
+
+# --- Generate observed variables via PPCA ---
+make_group_data <- function(Z, p, sigma2) {
+  k  <- ncol(Z)
+  W  <- matrix(rnorm(p * k), nrow = p)
+  mu <- rnorm(p)
+  E  <- matrix(rnorm(n6 * p, sd = sqrt(sigma2)), nrow = n6)
+  sweep(Z %*% t(W) + E, 2, mu, "+")
+}
+
+X1 <- make_group_data(Z1, p_grps[1], sigma2_grps[1])
+X2 <- make_group_data(Z2, p_grps[2], sigma2_grps[2])
+X3 <- make_group_data(Z3, p_grps[3], sigma2_grps[3])
+
+data6  <- cbind(X1, X2, X3)
+groups6 <- list(1:5, 6:9, 10:13)
+
+# --- Granularity search ---
+candidates6 <- list(G1 = 1:4, G2 = 1:3, G3 = 1:3)
+grid6       <- expand.grid(candidates6)
+
+results6 <- do.call(rbind, lapply(seq_len(nrow(grid6)), function(i) {
+  k_vec <- as.integer(grid6[i, ])
+  res   <- learn_bn_pca_bic(data6, groups6, k_vec)
+  data.frame(G1_npc = k_vec[1], G2_npc = k_vec[2], G3_npc = k_vec[3],
+             bic_combined = res$bic_combined)
+}))
+
+results6 <- results6[order(-results6$bic_combined), ]
+
+cat("\nCheck 6: Granularity search results (top 8):\n")
+print(head(results6, 8), row.names = FALSE)
+
+best6 <- results6[1, ]
+cat(sprintf("\nBest found   : G1=%d, G2=%d, G3=%d\n",
+            best6$G1_npc, best6$G2_npc, best6$G3_npc))
+cat(sprintf("True k*      : G1=%d, G2=%d, G3=%d\n",
+            k_true[1], k_true[2], k_true[3]))
+
+if (all(as.integer(best6[1:3]) == k_true)) {
+  cat("Check 6 passed: combined BIC recovered the true granularity.\n")
+} else {
+  cat("Check 6: best config differs from true k* -- inspect top results.\n")
+}
+```
+
+```{r}
+# Re-run check 6 with larger n to see if true k* is recovered asymptotically
+for (n_try in c(500, 1000, 2000, 5000, 10000, 20000)) {
+  set.seed(99)
+  
+  Z1 <- cbind(rnorm(n_try), rnorm(n_try))
+  Z2 <- cbind(0.7 * Z1[,1] + rnorm(n_try, sd = 0.5))
+  Z3 <- cbind(0.6 * Z2[,1] + rnorm(n_try, sd = 0.5), rnorm(n_try))
+  
+  make_group_data_n <- function(Z, p, sigma2, n) {
+    k  <- ncol(Z)
+    W  <- matrix(rnorm(p * k), nrow = p)
+    mu <- rnorm(p)
+    E  <- matrix(rnorm(n * p, sd = sqrt(sigma2)), nrow = n)
+    sweep(Z %*% t(W) + E, 2, mu, "+")
+  }
+  
+  X1 <- make_group_data_n(Z1, 5, 0.3, n_try)
+  X2 <- make_group_data_n(Z2, 4, 0.4, n_try)
+  X3 <- make_group_data_n(Z3, 4, 0.3, n_try)
+  
+  data_try   <- cbind(X1, X2, X3)
+  grid_try   <- expand.grid(list(G1=1:4, G2=1:3, G3=1:3))
+  
+  results_try <- do.call(rbind, lapply(seq_len(nrow(grid_try)), function(i) {
+    k_vec <- as.integer(grid_try[i,])
+    res   <- learn_bn_pca_bic(data_try, groups6, k_vec)
+    data.frame(G1=k_vec[1], G2=k_vec[2], G3=k_vec[3], bic=res$bic_combined)
+  }))
+  
+  best_try <- results_try[which.max(results_try$bic), ]
+  cat(sprintf("n=%5d: best = G1=%d, G2=%d, G3=%d\n",
+              n_try, best_try$G1, best_try$G2, best_try$G3))
+}
+```
+
