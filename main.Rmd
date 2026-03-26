@@ -44,27 +44,59 @@ Arguments:
 Returns: scalar log-likelihood value
 
 ```{r}
-# Replaces ppca_loglik
-ppca_conditional_loglik <- function(X_group, k) {
+ppca_loglik <- function(X_group, k) {
+  n <- nrow(X_group)
+  p <- ncol(X_group)
+ 
+  if (k < 1 || k >= p)
+    stop(sprintf("k must satisfy 1 <= k < p. Got k=%d, p=%d.", k, p))
+ 
+  # ML covariance eigenvalues = sample eigenvalues scaled by (n-1)/n
+  # (prcomp returns sdev based on division by n-1)
+  pca_res    <- prcomp(X_group, center = TRUE, scale. = FALSE)
+  eigenvalues <- (pca_res$sdev^2) * (n - 1) / n
+ 
+  # ML noise variance: average of discarded eigenvalues
+  sigma2_hat <- mean(eigenvalues[(k + 1):p])
+ 
+  if (sigma2_hat <= .Machine$double.eps) {
+    warning(sprintf(
+      "Group with p=%d, k=%d: noise variance is (near) zero; PPCA likelihood undefined.",
+      p, k))
+    return(NA_real_)
+  }
+ 
+  # Log-likelihood at ML estimates
+  loglik <- -(n / 2) * (
+    p * log(2 * pi) +
+    sum(log(eigenvalues[1:k])) +
+    (p - k) * log(sigma2_hat) +
+    p
+  )
+ 
+  return(loglik)
+}
+
+ppca_discarded_loglik <- function(X_group, k) {
   n <- nrow(X_group)
   p <- ncol(X_group)
 
   if (k < 1 || k >= p)
     stop(sprintf("k must satisfy 1 <= k < p. Got k=%d, p=%d.", k, p))
 
-  pca_res     <- prcomp(X_group, center = TRUE, scale. = FALSE)
+  pca_res    <- prcomp(X_group, center = TRUE, scale. = FALSE)
   eigenvalues <- (pca_res$sdev^2) * (n - 1) / n
 
-  # sigma^2 averaged over ALL p dimensions (fitted residual is 0 in first k dims)
-  sigma2_hat  <- sum(eigenvalues[(k + 1):p]) / p
+  sigma2_hat <- mean(eigenvalues[(k + 1):p])
 
   if (sigma2_hat <= .Machine$double.eps) {
     warning(sprintf("Group p=%d, k=%d: sigma2 near zero.", p, k))
     return(NA_real_)
   }
 
-  -(n * p / 2) * (log(2 * pi) + log(sigma2_hat) + 1)
+  -(n * (p - k) / 2) * (log(2 * pi * sigma2_hat) + 1)
 }
+
 ```
 
 2. Number of free parameters in PPCA for a single group
@@ -136,7 +168,7 @@ learn_bn_pca_bic <- function(data, groups, n_pcs) {
     colnames(scores_j) <- paste0("G", j, "_PC", seq_len(k_j))
 
     pc_list[[j]]        <- scores_j
-    ppca_ll_vals[j]     <- ppca_conditional_loglik(X_j, k_j)  
+    ppca_ll_vals[j] <- ppca_discarded_loglik(X_j, k_j)   
     ppca_nparam_vals[j] <- ppca_nparams(p_j, k_j)             
   }
 

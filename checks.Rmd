@@ -15,6 +15,7 @@ This is an R Markdown document. Markdown is a simple formatting syntax for autho
 
 When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
+
 ```{r}
 library(mvtnorm)
 
@@ -47,10 +48,29 @@ cat(sprintf("PPCA ML log-likelihood    : %.3f\n", ll_ppca))
 cat(sprintf("Difference (should be small for large n): %.3f\n", ll_ppca - ll_exact))
 stopifnot(ll_ppca >= ll_exact)  # ML estimates cannot do worse than true params
 ```
+```{r}
+# Compute independent BN loglik on retained PC scores
+# (each PC score ~ N(0, lambda_j), independent by construction of PCA)
+pca_res     <- prcomp(X_group, center = TRUE, scale. = FALSE)
+eigenvalues <- (pca_res$sdev^2) * (n - 1) / n
+scores_k    <- pca_res$x[, 1:k]
 
+indep_bn_loglik <- sum(sapply(1:k, function(j) {
+  -n/2 * (log(2 * pi * eigenvalues[j]) + 1)
+}))
+
+ll_discarded <- ppca_discarded_loglik(X_group, k)
+ll_combined  <- ll_discarded + indep_bn_loglik
+ll_tipping   <- ppca_loglik(X_group, k)   # original T&B function
+
+cat(sprintf("ppca_discarded + indep BN loglik : %.3f\n", ll_combined))
+cat(sprintf("ppca_loglik (T&B)                : %.3f\n", ll_tipping))
+cat(sprintf("Difference (should be ~0)        : %.6f\n", ll_combined - ll_tipping))
+stopifnot(abs(ll_combined - ll_tipping) < 1e-6)
+```
 ```{r}
 X_test <- matrix(rnorm(300 * 8), nrow = 300)
-lls <- sapply(1:7, function(k) ppca_loglik(X_test, k))
+lls <- sapply(1:7, function(k) ppca_discarded_loglik(X_test, k))
 stopifnot(all(diff(lls) > 0))
 ```
 
@@ -58,7 +78,7 @@ stopifnot(all(diff(lls) > 0))
 # Assumes W, sigma2, mu, p, k (=2), X_group are still in the workspace from check 1
 
 # Compute PPCA log-likelihood for all candidate k values
-lls_structured <- sapply(1:(p - 1), function(k_try) ppca_loglik(X_group, k_try))
+lls_structured <- sapply(1:(p - 1), function(k_try) ppca_discarded_loglik(X_group, k_try))
 diffs          <- diff(lls_structured)
 
 cat("Log-likelihoods by k:\n")
@@ -179,7 +199,7 @@ if (all(as.integer(best6[1:3]) == k_true)) {
 
 ```{r}
 # Re-run check 6 with larger n to see if true k* is recovered asymptotically
-for (n_try in c(500, 1000, 2000, 5000, 10000, 20000)) {
+for (n_try in c(100, 200, 500, 1000, 2000, 5000, 10000, 20000)) {
   set.seed(99)
   
   Z1 <- cbind(rnorm(n_try), rnorm(n_try))
