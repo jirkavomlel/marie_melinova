@@ -288,6 +288,12 @@ print_obs_conditionals <- function(data, groups, result) {
   n_pcs <- result$n_pcs
   g     <- length(groups)
 
+  # Fix 1: ensure factor levels are correct regardless of how cbind stored them
+  disc_data <- result$disc_data
+  for (col in names(disc_data))
+    disc_data[[col]] <- factor(as.character(disc_data[[col]]),
+                               levels = c("low", "mid", "high"))
+
   for (j in seq_len(g)) {
     X_j   <- data[, groups[[j]], drop = FALSE]
     k_j   <- n_pcs[j]
@@ -303,25 +309,25 @@ print_obs_conditionals <- function(data, groups, result) {
     mu_j     <- colMeans(X_j)
     scores_j <- pca_j$x[, 1:k_j, drop = FALSE]
 
-    # Retrieve discretized scores for this group from the stored disc_data
-    disc_cols <- grep(sprintf("^G%d_PC", j), names(result$disc_data), value = TRUE)
-    disc_j    <- result$disc_data[, disc_cols, drop = FALSE]
+    disc_cols <- grep(sprintf("^G%d_PC", j), names(disc_data), value = TRUE)
+    disc_j    <- disc_data[, disc_cols, drop = FALSE]
+
+    state_levels <- c("low", "mid", "high")
 
     # Compute within-state conditional means for each PC
-    state_levels <- c("low", "mid", "high")
     z_tilde_list <- vector("list", k_j)
     for (pc in seq_len(k_j)) {
       z_tilde_list[[pc]] <- sapply(state_levels, function(s) {
-        idx <- which(disc_j[[pc]] == s)
+        idx <- which(as.character(disc_j[[pc]]) == s)  # Fix 1: use as.character
         if (length(idx) == 0) NA_real_ else mean(scores_j[idx, pc])
       })
     }
 
-    # Compute sigma^2 (mean squared reconstruction residual)
+    # Compute sigma^2 using within-state means
     z_tilde_mat <- matrix(0, nrow = n, ncol = k_j)
     for (pc in seq_len(k_j)) {
       for (s in state_levels) {
-        idx <- which(disc_j[[pc]] == s)
+        idx <- which(as.character(disc_j[[pc]]) == s)
         if (length(idx) > 0)
           z_tilde_mat[idx, pc] <- z_tilde_list[[pc]][s]
       }
@@ -332,26 +338,30 @@ print_obs_conditionals <- function(data, groups, result) {
     cat(sprintf("Shared noise variance sigma^2 = %.4f  (sd = %.4f)\n\n",
                 sigma2_hat, sqrt(sigma2_hat)))
 
-    # Print within-state PC means
+    # Fix 3: unname values to avoid named-scalar column naming issues
     cat("Within-state conditional means of PC scores:\n")
     z_tilde_df <- do.call(rbind, lapply(seq_len(k_j), function(pc) {
-      data.frame(PC    = sprintf("G%d_PC%d", j, pc),
-                 low   = round(z_tilde_list[[pc]]["low"],  4),
-                 mid   = round(z_tilde_list[[pc]]["mid"],  4),
-                 high  = round(z_tilde_list[[pc]]["high"], 4),
-                 row.names = NULL)
+      data.frame(
+        PC   = sprintf("G%d_PC%d", j, pc),
+        low  = round(unname(z_tilde_list[[pc]]["low"]),  4),
+        mid  = round(unname(z_tilde_list[[pc]]["mid"]),  4),
+        high = round(unname(z_tilde_list[[pc]]["high"]), 4),
+        row.names = NULL
+      )
     }))
     print(z_tilde_df, row.names = FALSE)
 
     # Print conditional mean vectors for each state combination
-    state_grid <- expand.grid(replicate(k_j, state_levels, simplify = FALSE))
+    state_grid <- expand.grid(replicate(k_j, state_levels, simplify = FALSE),
+                              stringsAsFactors = FALSE)
     names(state_grid) <- sprintf("G%d_PC%d", j, seq_len(k_j))
 
     cat(sprintf("\nConditional mean vectors E[X_g | states]  (%d combinations):\n",
                 nrow(state_grid)))
 
     for (r in seq_len(nrow(state_grid))) {
-      state_vec <- as.character(state_grid[r, ])
+      # Fix 2: extract state labels column by column, not with as.character on a row
+      state_vec <- sapply(seq_len(k_j), function(pc) state_grid[r, pc])
       z_vec     <- sapply(seq_len(k_j), function(pc) z_tilde_list[[pc]][state_vec[pc]])
       cond_mean <- mu_j + W_j %*% z_vec
 
