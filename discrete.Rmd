@@ -1,0 +1,370 @@
+---
+title: "Discrete version"
+output: html_document
+date: "2026-03-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+# =============================================================================
+# Discrete PPCA + BN learning with combined BIC
+# =============================================================================
+
+library(bnlearn)
+
+# -----------------------------------------------------------------------------
+# Discretize a matrix of PC scores into 3 states by tertile thresholds
+# Returns a data frame of ordered factors
+# -----------------------------------------------------------------------------
+discretize_scores <- function(scores) {
+  as.data.frame(lapply(as.data.frame(scores), function(col) {
+    cuts <- quantile(col, probs = c(1/3, 2/3))
+    cut(col,
+        breaks = c(-Inf, cuts, Inf),
+        labels = c("low", "mid", "high"),
+        ordered_result = FALSE,
+        include.lowest = TRUE)
+  }))
+}
+
+
+# -----------------------------------------------------------------------------
+# Reconstruction log-likelihood for one group
+# (Gaussian mixture with state-dependent means on W column space)
+#
+# Uses simplified version: covariance = sigma^2 I (drops within-state variance)
+# sigma^2 estimated as mean squared residual over all n*p_g terms
+# -----------------------------------------------------------------------------
+recon_loglik <- function(X_group, pca_res, k, disc_scores_g) {
+  n  <- nrow(X_group)
+  p  <- ncol(X_group)
+
+  # Conditional means of Z given discrete state (empirical within-state means)
+  scores_cont <- pca_res$x[, 1:k, drop = FALSE]
+  state_means <- sapply(levels(disc_scores_g[[1]]), function(s) {
+    NULL  # placeholder -- see below
+  })
+
+  # For each observation, get the within-state conditional mean of each PC
+  z_tilde <- matrix(0, nrow = n, ncol = k)
+  for (j in 1:k) {
+    col_j  <- disc_scores_g[[j]]
+    cont_j <- scores_cont[, j]
+    for (s in levels(col_j)) {
+      idx          <- which(col_j == s)
+      z_tilde[idx, j] <- mean(cont_j[idx])
+    }
+  }
+
+  # Reconstructed X using W and z_tilde
+  W_k       <- pca_res$rotation[, 1:k, drop = FALSE]
+  mu_hat    <- colMeans(X_group)
+  X_recon   <- sweep(z_tilde %*% t(W_k), 2, mu_hat, "+")
+
+  # Estimate sigma^2 as mean squared residual
+  residuals  <- X_group - X_recon
+  sigma2_hat <- mean(residuals^2)
+
+  if (sigma2_hat <= .Machine$double.eps) {
+    warning("sigma2_hat near zero in recon_loglik")
+    return(NA_real_)
+  }
+
+  # Gaussian log-likelihood
+  -(n * p / 2) * (log(2 * pi * sigma2_hat) + 1)
+}
+
+
+# -----------------------------------------------------------------------------
+# Parameter count for reconstruction component
+# Loadings + means + sigma^2 + 2 thresholds per PC
+# -----------------------------------------------------------------------------
+recon_nparams <- function(p, k) {
+  k * p - k * (k - 1) / 2 +   # loadings (corrected for rotation)
+  p +                           # group means
+  1 +                           # sigma^2
+  2 * k                         # discretization thresholds (2 per PC)
+}
+
+
+# -----------------------------------------------------------------------------
+# Compute combined BIC for a given granularity vector
+# Returns list with bic_combined and all components
+# -----------------------------------------------------------------------------
+compute_combined_bic_disc <- function(data, groups, n_pcs) {
+  data <- as.matrix(data)
+  n    <- nrow(data)
+  g    <- length(groups)
+
+  pca_results  <- vector("list", g)
+  disc_list    <- vector("list", g)
+  recon_ll     <- numeric(g)
+  recon_np     <- integer(g)
+
+  for (j in seq_len(g)) {
+    X_j  <- data[, groups[[j]], drop = FALSE]
+    k_j  <- n_pcs[j]
+    p_j  <- ncol(X_j)
+
+    pca_j          <- prcomp(X_j, center = TRUE, scale. = FALSE)
+    pca_results[[j]] <- pca_j
+
+    scores_j       <- pca_j$x[, 1:k_j, drop = FALSE]
+    colnames(scores_j) <- paste0("G", j, "_PC", seq_len(k_j))
+
+    disc_j         <- discretize_scores(scores_j)
+    disc_list[[j]] <- disc_j
+
+    recon_ll[j]    <- recon_loglik(X_j, pca_j, k_j, disc_j)
+    recon_np[j]    <- recon_nparams(p_j, k_j)
+  }
+
+  # Assemble discrete BN dataset
+  disc_data <- do.call(cbind, disc_list)
+  for (col in names(disc_data))
+    disc_data[[col]] <- factor(disc_data[[col]], levels = c("low","mid","high"))
+
+  # Learn BN structure via hill-climbing with discrete BIC
+  bn_dag    <- hc(disc_data, score = "bic")
+  bn_bic    <- score(bn_dag, data = disc_data, type = "bic")
+
+  # Recover BN log-likelihood and parameter count from bnlearn BIC
+  # bnlearn BIC = loglik - log(n)/2 * nparams
+  # => need logLik separately
+  bn_fit    <- bn.fit(bn_dag, disc_data)
+  bn_ll     <- logLik(bn_fit, data = disc_data)
+  bn_np     <- round(2 * (bn_ll - bn_bic) / log(n))
+
+  total_ll  <- bn_ll + sum(recon_ll)
+  total_np  <- bn_np + sum(recon_np)
+  bic_comb  <- total_ll - (log(n) / 2) * total_np
+
+  list(
+    bn_dag       = bn_dag,
+    bn_fit       = bn_fit,
+    disc_data    = disc_data,
+    bn_loglik    = bn_ll,
+    bn_nparams   = bn_np,
+    recon_ll     = recon_ll,
+    recon_np     = recon_np,
+    total_loglik = total_ll,
+    total_nparams = total_np,
+    bic_combined = bic_comb,
+    n_pcs        = n_pcs
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# Coordinate ascent algorithm
+# -----------------------------------------------------------------------------
+learn_disc_bn_pca <- function(data,
+                               groups,
+                               max_iter    = 20,
+                               n_restarts  = 3,
+                               verbose     = TRUE) {
+  data   <- as.matrix(data)
+  g      <- length(groups)
+  p_grps <- sapply(groups, length)
+  k_max  <- p_grps - 1L   # upper bound per group
+
+  best_global     <- NULL
+  best_global_bic <- -Inf
+
+  for (restart in seq_len(n_restarts)) {
+
+    # Initialise: random k_g in {1, ..., min(3, k_max_g)}
+    k_curr <- sapply(k_max, function(km) sample(1:min(3, km), 1))
+    res    <- compute_combined_bic_disc(data, groups, k_curr)
+    bic_curr <- res$bic_combined
+
+    if (verbose)
+      cat(sprintf("\n--- Restart %d | Init k=(%s) | BIC=%.2f\n",
+                  restart, paste(k_curr, collapse=","), bic_curr))
+
+    for (iter in seq_len(max_iter)) {
+      improved <- FALSE
+
+      for (j in seq_len(g)) {
+
+        # Candidate values: k_j - 1, k_j + 1 (current is already evaluated)
+        candidates <- setdiff(
+          c(k_curr[j] - 1L, k_curr[j] + 1L),
+          c(0L, k_max[j] + 1L)
+        )
+
+        for (k_try in candidates) {
+          k_new      <- k_curr
+          k_new[j]   <- k_try
+          res_try    <- compute_combined_bic_disc(data, groups, k_new)
+          bic_try    <- res_try$bic_combined
+
+          if (verbose)
+            cat(sprintf("  Iter %d | Group %d | k=(%s) | BIC=%.2f %s\n",
+                        iter, j,
+                        paste(k_new, collapse=","),
+                        bic_try,
+                        ifelse(bic_try > bic_curr, "<-- improved", "")))
+
+          if (bic_try > bic_curr) {
+            k_curr   <- k_new
+            bic_curr <- bic_try
+            res      <- res_try
+            improved <- TRUE
+          }
+        }
+      }
+
+      if (!improved) {
+        if (verbose) cat(sprintf("  Converged at iter %d.\n", iter))
+        break
+      }
+    }
+
+    if (bic_curr > best_global_bic) {
+      best_global_bic <- bic_curr
+      best_global     <- res
+    }
+  }
+
+  if (verbose) {
+    cat(sprintf("\n=== Best solution across %d restarts ===\n", n_restarts))
+    cat(sprintf("  k = (%s)\n", paste(best_global$n_pcs, collapse=",")))
+    cat(sprintf("  BIC_combined = %.3f\n", best_global_bic))
+  }
+
+  best_global
+}
+
+
+# =============================================================================
+# Example usage on synthetic data from check 6
+# =============================================================================
+set.seed(99)
+n6     <- 500
+Z1     <- cbind(rnorm(n6), rnorm(n6))
+Z2     <- cbind(0.7 * Z1[,1] + rnorm(n6, sd=0.5))
+Z3     <- cbind(0.6 * Z2[,1] + rnorm(n6, sd=0.5), rnorm(n6))
+
+make_group_data <- function(Z, p, sigma2) {
+  k  <- ncol(Z); W  <- matrix(rnorm(p*k), nrow=p); mu <- rnorm(p)
+  E  <- matrix(rnorm(nrow(Z)*p, sd=sqrt(sigma2)), nrow=nrow(Z))
+  sweep(Z %*% t(W) + E, 2, mu, "+")
+}
+
+X1     <- make_group_data(Z1, 5, 0.3)
+X2     <- make_group_data(Z2, 4, 0.4)
+X3     <- make_group_data(Z3, 4, 0.3)
+data6  <- cbind(X1, X2, X3)
+groups6 <- list(1:5, 6:9, 10:13)
+
+result_disc <- learn_disc_bn_pca(data6, groups6,
+                                  max_iter   = 20,
+                                  n_restarts = 3,
+                                  verbose    = TRUE)
+
+cat("\nLearned BN structure:\n")
+print(result_disc$bn_dag)
+```
+```{r}
+# Pretty-printed summary of all nodes ---
+for (node in names(result_disc$bn_fit)) {
+  cat(sprintf("\n=== Node: %s ===\n", node))
+  print(result_disc$bn_fit[[node]]$prob)
+}
+```
+```{r}
+print_obs_conditionals <- function(data, groups, result) {
+  data  <- as.matrix(data)
+  n_pcs <- result$n_pcs
+  g     <- length(groups)
+
+  for (j in seq_len(g)) {
+    X_j   <- data[, groups[[j]], drop = FALSE]
+    k_j   <- n_pcs[j]
+    p_j   <- ncol(X_j)
+    n     <- nrow(X_j)
+
+    cat(sprintf("\n%s\n", strrep("=", 60)))
+    cat(sprintf("Group %d | %d observed variables | %d PC(s)\n", j, p_j, k_j))
+    cat(sprintf("%s\n", strrep("=", 60)))
+
+    pca_j    <- prcomp(X_j, center = TRUE, scale. = FALSE)
+    W_j      <- pca_j$rotation[, 1:k_j, drop = FALSE]
+    mu_j     <- colMeans(X_j)
+    scores_j <- pca_j$x[, 1:k_j, drop = FALSE]
+
+    # Retrieve discretized scores for this group from the stored disc_data
+    disc_cols <- grep(sprintf("^G%d_PC", j), names(result$disc_data), value = TRUE)
+    disc_j    <- result$disc_data[, disc_cols, drop = FALSE]
+
+    # Compute within-state conditional means for each PC
+    state_levels <- c("low", "mid", "high")
+    z_tilde_list <- vector("list", k_j)
+    for (pc in seq_len(k_j)) {
+      z_tilde_list[[pc]] <- sapply(state_levels, function(s) {
+        idx <- which(disc_j[[pc]] == s)
+        if (length(idx) == 0) NA_real_ else mean(scores_j[idx, pc])
+      })
+    }
+
+    # Compute sigma^2 (mean squared reconstruction residual)
+    z_tilde_mat <- matrix(0, nrow = n, ncol = k_j)
+    for (pc in seq_len(k_j)) {
+      for (s in state_levels) {
+        idx <- which(disc_j[[pc]] == s)
+        if (length(idx) > 0)
+          z_tilde_mat[idx, pc] <- z_tilde_list[[pc]][s]
+      }
+    }
+    X_recon    <- sweep(z_tilde_mat %*% t(W_j), 2, mu_j, "+")
+    sigma2_hat <- mean((X_j - X_recon)^2)
+
+    cat(sprintf("Shared noise variance sigma^2 = %.4f  (sd = %.4f)\n\n",
+                sigma2_hat, sqrt(sigma2_hat)))
+
+    # Print within-state PC means
+    cat("Within-state conditional means of PC scores:\n")
+    z_tilde_df <- do.call(rbind, lapply(seq_len(k_j), function(pc) {
+      data.frame(PC    = sprintf("G%d_PC%d", j, pc),
+                 low   = round(z_tilde_list[[pc]]["low"],  4),
+                 mid   = round(z_tilde_list[[pc]]["mid"],  4),
+                 high  = round(z_tilde_list[[pc]]["high"], 4),
+                 row.names = NULL)
+    }))
+    print(z_tilde_df, row.names = FALSE)
+
+    # Print conditional mean vectors for each state combination
+    state_grid <- expand.grid(replicate(k_j, state_levels, simplify = FALSE))
+    names(state_grid) <- sprintf("G%d_PC%d", j, seq_len(k_j))
+
+    cat(sprintf("\nConditional mean vectors E[X_g | states]  (%d combinations):\n",
+                nrow(state_grid)))
+
+    for (r in seq_len(nrow(state_grid))) {
+      state_vec <- as.character(state_grid[r, ])
+      z_vec     <- sapply(seq_len(k_j), function(pc) z_tilde_list[[pc]][state_vec[pc]])
+      cond_mean <- mu_j + W_j %*% z_vec
+
+      state_label <- paste(sprintf("G%d_PC%d=%s", j, seq_len(k_j), state_vec),
+                           collapse = ", ")
+      cat(sprintf("\n  %s\n", state_label))
+      cat(sprintf("  E[X_%d] = %s\n", j,
+                  paste(round(cond_mean, 4), collapse = ", ")))
+    }
+  }
+}
+
+# Usage
+print_obs_conditionals(data6, groups6, result_disc)
+```
+
